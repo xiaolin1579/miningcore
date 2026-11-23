@@ -65,32 +65,49 @@ public class PoolApiController : ApiControllerBase
         {
             Pools = await Task.WhenAll(clusterConfig.Pools.Where(x => x.Enabled).Select(async config =>
             {
-                // load stats
-                var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id, ct));
-
                 // get pool
                 pools.TryGetValue(config.Id, out var pool);
 
+                var auxExtra = config.Extra?.SafeExtensionDataAs<Blockchain.Bitcoin.Configuration.BitcoinPoolConfigExtra>();
+                var hasAux = auxExtra?.AuxChains is { Length: > 0 };
+
+                var from = clock.Now.AddHours(-topMinersRange);
+
+                // none of these depend on each other: fire them all off together instead of
+                // chaining ~9 awaits end-to-end (that chain, times every enabled pool running
+                // concurrently, was what made this endpoint take ~5s to answer). The block and
+                // aux-block counts/times/reward are each now one merged query instead of 5 + 2.
+                var statsTask = cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id, ct));
+                var totalPaidTask = cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id, ct));
+                var blockSummaryTask = cf.Run(con => blocksRepo.GetPoolBlockSummaryAsync(con, config.Id, ct));
+                var auxSummaryTask = hasAux ? cf.Run(con => auxBlocksRepo.GetPoolAuxBlockSummaryAsync(con, config.Id, ct)) : null;
+                var minersTask = cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15, ct));
+
+                if(auxSummaryTask != null)
+                    await Task.WhenAll(statsTask, totalPaidTask, blockSummaryTask, auxSummaryTask, minersTask);
+                else
+                    await Task.WhenAll(statsTask, totalPaidTask, blockSummaryTask, minersTask);
+
                 // map
-                var result = config.ToPoolInfo(mapper, stats, pool);
+                var result = config.ToPoolInfo(mapper, statsTask.Result, pool);
 
                 // enrich
-                result.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id, ct));
-                result.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, config.Id, ct));
-                result.TotalConfirmedBlocks = await cf.Run(con => blocksRepo.GetTotalConfirmedBlocksAsync(con, config.Id, ct));
-                result.TotalPendingBlocks = await cf.Run(con => blocksRepo.GetTotalPendingBlocksAsync(con, config.Id, ct));
+                result.TotalPaid = totalPaidTask.Result;
+                var blockSummary = blockSummaryTask.Result;
+                result.TotalBlocks = blockSummary.TotalBlocks;
+                result.TotalConfirmedBlocks = blockSummary.TotalConfirmedBlocks;
+                result.TotalPendingBlocks = blockSummary.TotalPendingBlocks;
                 // get reward of the last confirmed block and set BlockReward; fall back to current job's coinbase value
-                result.BlockReward = await cf.Run(con => blocksRepo.GetLastConfirmedBlockRewardAsync(con, config.Id, ct));
+                result.BlockReward = blockSummary.LastConfirmedReward ?? 0;
                 if(result.BlockReward == 0 && pool != null)
                     result.BlockReward = pool.NetworkStats?.BlockReward ?? 0;
-                var lastBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, config.Id, ct));
+                var lastBlockTime = blockSummary.LastBlockTime;
                 result.LastPoolBlockTime = lastBlockTime;
 
-                var auxExtra = config.Extra?.SafeExtensionDataAs<Blockchain.Bitcoin.Configuration.BitcoinPoolConfigExtra>();
-                if(auxExtra?.AuxChains is { Length: > 0 })
+                if(auxSummaryTask != null)
                 {
-                    result.TotalAuxBlocks = await cf.Run(con => auxBlocksRepo.GetPoolAuxBlockCountAsync(con, config.Id, ct));
-                    result.LastAuxBlockTime = await cf.Run(con => auxBlocksRepo.GetLastPoolAuxBlockTimeAsync(con, config.Id, ct));
+                    result.TotalAuxBlocks = auxSummaryTask.Result.TotalAuxBlocks;
+                    result.LastAuxBlockTime = auxSummaryTask.Result.LastAuxBlockTime;
                 }
 
                 var payoutConfig = config.PaymentProcessing;
@@ -98,6 +115,7 @@ public class PoolApiController : ApiControllerBase
                 if(payoutConfig?.PayoutScheme != PayoutScheme.PPLNSBF && result.PaymentProcessing?.PayoutSchemeConfig != null)
                     result.PaymentProcessing.PayoutSchemeConfig.BlockFinderPercentage = null;
 
+                // depends on lastBlockTime, so it can't join the batch above
                 if(lastBlockTime.HasValue && pool != null)
                 {
                     var startTime = lastBlockTime.Value;
@@ -106,11 +124,7 @@ public class PoolApiController : ApiControllerBase
                         result.PoolEffort = poolEffort.Value;
                 }
 
-                var from = clock.Now.AddHours(-topMinersRange);
-
-                var minersByHashrate = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15, ct));
-
-                result.TopMiners = minersByHashrate.Select(mapper.ToResponse).ToArray();
+                result.TopMiners = minersTask.Result.Select(mapper.ToResponse).ToArray();
 
                 return result;
             }).ToArray())
@@ -151,34 +165,50 @@ public class PoolApiController : ApiControllerBase
     {
         var pool = GetPool(poolId);
 
-        // load stats
-        var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id, ct));
-
         // get pool
         pools.TryGetValue(pool.Id, out var poolInstance);
 
+        var auxExtra = pool.Extra?.SafeExtensionDataAs<Blockchain.Bitcoin.Configuration.BitcoinPoolConfigExtra>();
+        var hasAux = auxExtra?.AuxChains is { Length: > 0 };
+
+        var from = clock.Now.AddHours(-topMinersRange);
+
+        // none of these depend on each other: fire them all off together instead of
+        // chaining ~9 awaits end-to-end. The block and aux-block counts/times/reward are each
+        // now one merged query instead of 5 + 2.
+        var statsTask = cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id, ct));
+        var totalPaidTask = cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, pool.Id, ct));
+        var blockSummaryTask = cf.Run(con => blocksRepo.GetPoolBlockSummaryAsync(con, pool.Id, ct));
+        var auxSummaryTask = hasAux ? cf.Run(con => auxBlocksRepo.GetPoolAuxBlockSummaryAsync(con, pool.Id, ct)) : null;
+        var minersTask = cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, from, 0, 15, ct));
+
+        if(auxSummaryTask != null)
+            await Task.WhenAll(statsTask, totalPaidTask, blockSummaryTask, auxSummaryTask, minersTask);
+        else
+            await Task.WhenAll(statsTask, totalPaidTask, blockSummaryTask, minersTask);
+
         var response = new GetPoolResponse
         {
-            Pool = pool.ToPoolInfo(mapper, stats, poolInstance)
+            Pool = pool.ToPoolInfo(mapper, statsTask.Result, poolInstance)
         };
 
         // enrich
-        response.Pool.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, pool.Id, ct));
-        response.Pool.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, pool.Id, ct));
-        response.Pool.TotalConfirmedBlocks = await cf.Run(con => blocksRepo.GetTotalConfirmedBlocksAsync(con, pool.Id, ct));
-        response.Pool.TotalPendingBlocks = await cf.Run(con => blocksRepo.GetTotalPendingBlocksAsync(con, pool.Id, ct));
+        response.Pool.TotalPaid = totalPaidTask.Result;
+        var blockSummary = blockSummaryTask.Result;
+        response.Pool.TotalBlocks = blockSummary.TotalBlocks;
+        response.Pool.TotalConfirmedBlocks = blockSummary.TotalConfirmedBlocks;
+        response.Pool.TotalPendingBlocks = blockSummary.TotalPendingBlocks;
         // get reward of the last confirmed block and set BlockReward; fall back to current job's coinbase value
-        response.Pool.BlockReward = await cf.Run(con => blocksRepo.GetLastConfirmedBlockRewardAsync(con, pool.Id, ct));
+        response.Pool.BlockReward = blockSummary.LastConfirmedReward ?? 0;
         if(response.Pool.BlockReward == 0 && poolInstance != null)
             response.Pool.BlockReward = poolInstance.NetworkStats?.BlockReward ?? 0;
-        var lastBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, pool.Id, ct));
+        var lastBlockTime = blockSummary.LastBlockTime;
         response.Pool.LastPoolBlockTime = lastBlockTime;
 
-        var auxExtra = pool.Extra?.SafeExtensionDataAs<Blockchain.Bitcoin.Configuration.BitcoinPoolConfigExtra>();
-        if(auxExtra?.AuxChains is { Length: > 0 })
+        if(auxSummaryTask != null)
         {
-            response.Pool.TotalAuxBlocks = await cf.Run(con => auxBlocksRepo.GetPoolAuxBlockCountAsync(con, pool.Id, ct));
-            response.Pool.LastAuxBlockTime = await cf.Run(con => auxBlocksRepo.GetLastPoolAuxBlockTimeAsync(con, pool.Id, ct));
+            response.Pool.TotalAuxBlocks = auxSummaryTask.Result.TotalAuxBlocks;
+            response.Pool.LastAuxBlockTime = auxSummaryTask.Result.LastAuxBlockTime;
         }
 
         var payoutConfig = pool.PaymentProcessing;
@@ -186,6 +216,7 @@ public class PoolApiController : ApiControllerBase
         if(payoutConfig?.PayoutScheme != PayoutScheme.PPLNSBF && response.Pool.PaymentProcessing?.PayoutSchemeConfig != null)
             response.Pool.PaymentProcessing.PayoutSchemeConfig.BlockFinderPercentage = null;
 
+        // depends on lastBlockTime, so it can't join the batch above
         if(lastBlockTime.HasValue && poolInstance != null)
         {
             var startTime = lastBlockTime.Value;
@@ -194,9 +225,7 @@ public class PoolApiController : ApiControllerBase
                 response.Pool.PoolEffort = poolEffort.Value;
         }
 
-        var from = clock.Now.AddHours(-topMinersRange);
-
-        response.Pool.TopMiners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, from, 0, 15, ct)))
+        response.Pool.TopMiners = minersTask.Result
             .Select(mapper.ToResponse)
             .ToArray();
 

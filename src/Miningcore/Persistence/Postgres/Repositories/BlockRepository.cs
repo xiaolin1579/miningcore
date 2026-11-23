@@ -172,6 +172,29 @@ public class BlockRepository : IBlockRepository
         return con.ExecuteScalarAsync<DateTime?>(new CommandDefinition(query, new { poolId }, cancellationToken: ct));
     }
 
+    public async Task<Model.Projections.PoolBlockSummary> GetPoolBlockSummaryAsync(IDbConnection con, string poolId, CancellationToken ct)
+    {
+        // Replaces four separate round trips (count, confirmed count, pending count, last
+        // confirmed reward, last block time) with one: the whole-pool aggregate is a single row
+        // (agg), so joining it to the last-confirmed-reward lookup via LATERAL doesn't multiply it.
+        const string query = @"
+            WITH agg AS (
+                SELECT
+                    COUNT(*) AS totalblocks,
+                    COUNT(*) FILTER (WHERE status = 'confirmed') AS totalconfirmedblocks,
+                    COUNT(*) FILTER (WHERE status = 'pending') AS totalpendingblocks,
+                    MAX(created) AS lastblocktime
+                FROM blocks WHERE poolid = @poolId
+            )
+            SELECT agg.*, r.reward AS lastconfirmedreward
+            FROM agg
+            LEFT JOIN LATERAL (
+                SELECT reward FROM blocks WHERE poolid = @poolId AND status = 'confirmed' ORDER BY created DESC LIMIT 1
+            ) r ON true";
+
+        return await con.QuerySingleAsync<Model.Projections.PoolBlockSummary>(new CommandDefinition(query, new { poolId }, cancellationToken: ct));
+    }
+
     public Task<DateTime?> GetLastMinerBlockTimeAsync(IDbConnection con, string poolId, string address, CancellationToken ct)
     {
         const string query = @"SELECT created FROM blocks WHERE poolid = @poolId AND miner = @address ORDER BY created DESC LIMIT 1";

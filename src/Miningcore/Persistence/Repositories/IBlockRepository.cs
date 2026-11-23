@@ -22,6 +22,7 @@ public interface IBlockRepository
     Task<DateTime?> GetLastMinerBlockTimeAsync(IDbConnection con, string poolId, string address, CancellationToken ct);
     Task<uint> GetMinerBlockCountAsync(IDbConnection con, string poolId, string address, CancellationToken ct);
     Task<DateTime?> GetLastPoolBlockTimeAsync(IDbConnection con, string poolId, CancellationToken ct);
+    Task<Model.Projections.PoolBlockSummary> GetPoolBlockSummaryAsync(IDbConnection con, string poolId, CancellationToken ct);
     Task<int> GetPoolBlockCountSinceAsync(IDbConnection con, string poolId, DateTime since, CancellationToken ct);
     Task<Block> GetBlockByPoolHeightAndTypeAsync(IDbConnection con, string poolId, long height, string type);
     Task<uint> GetPoolDuplicateBlockCountByPoolHeightNoTypeAndStatusAsync(IDbConnection con, string poolId, long height, BlockStatus[] status);

@@ -166,4 +166,12 @@ public class AuxBlockRepository : IAuxBlockRepository
         const string query = @"SELECT MAX(created) FROM auxblocks WHERE poolid = @poolId";
         return con.ExecuteScalarAsync<DateTime?>(new CommandDefinition(query, new { poolId }, cancellationToken: ct));
     }
+
+    public async Task<Model.Projections.PoolAuxBlockSummary> GetPoolAuxBlockSummaryAsync(IDbConnection con, string poolId, CancellationToken ct)
+    {
+        // Replaces GetPoolAuxBlockCountAsync + GetLastPoolAuxBlockTimeAsync with one round trip.
+        const string query = @"SELECT COUNT(*) AS totalauxblocks, MAX(created) AS lastauxblocktime FROM auxblocks WHERE poolid = @poolId";
+
+        return await con.QuerySingleAsync<Model.Projections.PoolAuxBlockSummary>(new CommandDefinition(query, new { poolId }, cancellationToken: ct));
+    }
 }
